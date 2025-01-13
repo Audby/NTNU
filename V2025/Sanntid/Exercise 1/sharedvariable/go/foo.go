@@ -3,31 +3,71 @@
 package main
 
 import (
-    . "fmt"
-    "runtime"
-    "time"
+	"fmt"
+	"runtime"
 )
 
-var i = 0
+type operation int
 
-func incrementing() {
-    for j:= 0; j < 1000000; j++ {
-        i++
-    }
+const (
+	increment operation = iota
+	decrement
+	get
+	quit
+)
+
+type request struct {
+	op   operation
+	resp chan int
 }
 
-func decrementing() {
-    //TODO: decrement i 1000000 times
+func numberServer(reqChan chan request) {
+	var i int = 0
+	for {
+		req := <-reqChan
+		switch req.op {
+		case increment:
+			i++
+		case decrement:
+			i--
+		case get:
+			req.resp <- i
+		case quit:
+			// Optionally signal termination if needed
+			close(reqChan)
+			return
+		}
+	}
+}
+
+func incrementing(incrementChan chan bool) {
+	for j := 0; j < 1000000; j++ {
+		reqChan <- request{op: increment}
+	}
+}
+
+func decrementing(decrementChan chan bool) {
+	for j := 0; j < 1000000; j++ {
+		reqChan <- request{op: decrement}
+	}
 }
 
 func main() {
-    // What does GOMAXPROCS do? What happens if you set it to 1?
-    runtime.GOMAXPROCS(2)    
-	
-    // TODO: Spawn both functions as goroutines
-	
-    // We have no direct way to wait for the completion of a goroutine (without additional synchronization of some sort)
-    // We will do it properly with channels soon. For now: Sleep.
-    time.Sleep(500*time.Millisecond)
-    Println("The magic number is:", i)
+
+	runtime.GOMAXPROCS(2)
+
+	reqChan := make(chan request)
+	go numberServer(reqChan)
+
+	go incrementing(reqChan)
+	go decrementing(reqChan)
+
+	var dummy string
+	fmt.Scanln(&dummy)
+
+	respChan := make(chan int)
+	reqChan <- request{op: get, resp: respChan}
+	finalValue := <-respChan
+
+	fmt.Println("The magic number is:", finalValue)
 }
