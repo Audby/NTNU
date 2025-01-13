@@ -8,7 +8,9 @@ int i = 0;
 
 // Note the return type: void*
 void* incrementingThreadFunction(){
-    // TODO: increment i 1_000_000 times
+    while (i < 10000000) {
+        i++;
+    }
     return NULL;
 }
 
