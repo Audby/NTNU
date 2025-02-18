@@ -1,0 +1,260 @@
+#%% [code]
+# Imports
+import numpy as np
+from scipy.integrate import solve_ivp
+from scipy.spatial.transform import Rotation
+import pythreejs as pj
+from IPython.display import display
+
+#%% [code]
+# Helper Functions
+
+def skew(v):
+    """Return the skew-symmetric matrix of vector v."""
+    return np.array([[    0, -v[2],  v[1]],
+                     [ v[2],     0, -v[0]],
+                     [-v[1],  v[0],    0]])
+
+def quat_derivative(q, omega):
+    # Extract components for clarity:
+    qw, qx, qy, qz = q
+    wx, wy, wz = omega
+    q_dot = 0.5 * np.array([
+        - qx*wx - qy*wy - qz*wz,
+         qw*wx + qy*wz - qz*wy,
+         qw*wy - qx*wz + qz*wx,
+         qw*wz + qx*wy - qy*wx
+    ])
+    return q_dot
+
+#%% [code]
+# Satellite Dynamics Function Generator
+def make_satellite_dynamics(b_M_c, G, m_T, total_mass):
+
+    def satellite_dynamics(t, x):
+        # Unpack state
+        i_r_c = x[0:3]
+        q = x[3:7]
+        i_v_c = x[7:10]
+        b_omega_ib = x[10:13]
+        
+        # Kinematics
+        # The rate of change of position is the velocity:
+        i_r_c_dot = i_v_c.copy()
+        
+        # The quaternion derivative is given by:
+        q_dot = quat_derivative(q, b_omega_ib)
+        
+        # Dynamics
+        # Translational acceleration (gravity acting at the center-of-mass):
+        r_norm = np.linalg.norm(i_r_c)
+        i_v_c_dot = - (G * m_T / r_norm**3) * i_r_c
+        
+        # Rotational acceleration:
+        # Newton-Euler (body frame): M_c^b * (dω/dt) + ω x (M_c^b * ω) = 0  (no external torque)
+        # Solve for angular acceleration:
+        # If b_M_c is a scalar multiple of I, then cross term will vanish; otherwise, it gives the coupling.
+        b_omega_ib_dot = - np.linalg.inv(b_M_c) @ np.cross(b_omega_ib, b_M_c @ b_omega_ib)
+        
+        # Pack the derivative of the state vector
+        state_dot = np.zeros_like(x)
+        state_dot[0:3] = i_r_c_dot
+        state_dot[3:7] = q_dot
+        state_dot[7:10] = i_v_c_dot
+        state_dot[10:13] = b_omega_ib_dot
+        
+        return state_dot
+    return satellite_dynamics
+
+#%% [code]
+# Simulation Constants and Initial Conditions
+
+# Earth and orbit parameters
+earth_radius = 6356e+3       # in meters
+orbit_height = 36000e+3      # in meters
+azi = np.pi / 4              # azimuth (radians)
+dec = np.pi / 4              # declination (radians)
+
+# Satellite geometry and mass properties
+l = 0.5                      # edge length in meters
+rho = 1                      # density (kg/m^3) so that mass m = rho*l^3
+m = rho * l**3               # mass of the cube
+
+# Toggle added mass case
+with_added_mass = True       # Set to True for extra mass, False for plain cube
+
+if with_added_mass:
+    m_added = 0.1          # extra mass in kg
+    total_mass = m + m_added
+    
+    # For a cube of edge l, the geometric center is at 0 and the corners are at ±l/2.
+    # We assume the extra mass is attached at the corner (l/2, l/2, l/2).
+    b_r_0 = (l/2) * np.ones((3,))  # position of the added mass relative to the cube's center
+    
+    # The new center-of-mass (expressed in the body frame) shifts from the geometric center.
+    # The vector from the new center-of-mass to the geometric center is:
+    b_r_s = - (m_added / total_mass) * b_r_0
+    
+    # Compute inertia about the geometric center.
+    # Inertia of the cube about its center:
+    I_cube = (1/6) * m * (l**2) * np.eye(3)
+    # Inertia of the point mass (using the formula: I_point = m*(||r||^2 I - r r^T)).
+    I_added = m_added * (np.dot(b_r_0, b_r_0) * np.eye(3) - np.outer(b_r_0, b_r_0))
+    # Alternatively, using the skew-symmetric form:
+    # I_added = - m_added * (skew(b_r_0) @ skew(b_r_0))
+    
+    # Inertia about the old origin (geometric center) with extra mass:
+    b_M_o = I_cube + I_added
+    
+    # Now, shift the inertia to the new center-of-mass using the parallel-axis theorem.
+    # Note: The parallel-axis shift adds: (total_mass)*(||b_r_s||^2 I - b_r_s b_r_s^T)
+    b_M_c = b_M_o + total_mass * (np.dot(b_r_s, b_r_s) * np.eye(3) - np.outer(b_r_s, b_r_s))
+else:
+    # Plain cube case: center-of-mass coincides with the geometric center.
+    total_mass = m
+    b_M_c = (m * (l**2) / 6) * np.eye(3)
+    b_r_s = np.zeros((3,))
+
+#%% [code]
+# Set up initial state for the simulation
+
+# Calculate initial position (center-of-mass) in the inertial frame.
+# We place the satellite in an orbit at a given height and direction.
+pos = (earth_radius + orbit_height) * np.array([
+    np.sin(dec) * np.cos(azi),
+    np.sin(dec) * np.sin(azi),
+    np.cos(dec)
+])
+
+# Choose a random initial orientation (as a quaternion).
+q = Rotation.random().as_quat()  # SciPy returns quaternions in [x, y, z, w] order by default.
+# We'll re-order to [w, x, y, z] for our purposes:
+q = np.array([q[3], q[0], q[1], q[2]])
+
+# Initial translational velocity: set to zero for simplicity.
+vel = np.zeros((3,))
+
+# Initial angular velocity (in radians per second) in the body frame.
+ang_vel = np.deg2rad(np.array([60, 80, 100]))
+
+# Construct the full state vector:
+# [position (3), quaternion (4), velocity (3), angular velocity (3)]
+state = np.hstack((pos, q, vel, ang_vel))
+
+#%% [code]
+# Create the dynamics function and integrate the ODE
+satellite_dynamics = make_satellite_dynamics(b_M_c, G=6.67e-11, m_T=5.972e+24, total_mass=total_mass)
+
+# Time parameters for simulation (in seconds)
+time_final = 12  # total simulation time
+t_eval = np.linspace(0, time_final, num=1001)
+
+# Solve the ODE
+result = solve_ivp(satellite_dynamics, (0, time_final), state, t_eval=t_eval)
+
+# Extract time and state trajectories
+time = result.t
+state_trajectory = result.y
+
+# For visualization purposes, we scale the positions down (so they’re not thousands of km).
+positions = (1e-7 * state_trajectory[0:3]).T
+# Orientation: extract quaternion trajectory.
+rotations = state_trajectory[3:7].T
+
+#%% [code]
+# Animation with pythreejs
+
+# Load cubemap textures (assumes you have images in a folder "space_cubemap")
+folder = "space_cubemap"
+texture_paths = [
+    f"./{folder}/px.png",  # Positive X
+    f"./{folder}/nx.png",  # Negative X
+    f"./{folder}/py.png",  # Positive Y
+    f"./{folder}/ny.png",  # Negative Y
+    f"./{folder}/pz.png",  # Positive Z
+    f"./{folder}/nz.png",  # Negative Z
+]
+
+box_sides = 500
+scene = pj.Scene()
+
+# Set up the camera for the skybox
+camera = pj.PerspectiveCamera(position=[0, 0, 5], up=[0, 1, 0], aspect=1)
+camera.lookAt([0, 0, 0])
+
+# Create skybox geometry and materials
+geometry = pj.BoxGeometry(width=box_sides, height=box_sides, depth=box_sides)
+materials = []
+for path in texture_paths:
+    texture = pj.ImageTexture(imageUri=path)
+    material = pj.MeshBasicMaterial(map=texture, side='BackSide')
+    materials.append(material)
+skybox = pj.Mesh(geometry, materials)
+scene.add(skybox)
+
+# Create the cubesat geometry (red cube)
+cubesat = pj.Mesh(
+    pj.BoxGeometry(1, 1, 1),
+    pj.MeshStandardMaterial(color='red')
+)
+# Create a small cube to represent the added mass (green) if applicable.
+the_added_mass = pj.Mesh(
+    pj.BoxGeometry(0.1, 0.1, 0.1),
+    pj.MeshStandardMaterial(color="green")
+)
+
+# The satellite body (red cube) is positioned relative to the new center-of-mass.
+# b_r_s (computed above) gives the displacement from the center-of-mass to the satellite's geometric center.
+cubesat.position = tuple(b_r_s.tolist())
+
+if with_added_mass:
+    # Place the added mass at the appropriate location relative to the satellite.
+    # For example, we can position it at the cube's corner.
+    the_added_mass.position = tuple((b_r_s + 0.5 * np.ones((3,))).tolist())
+
+# Add an axes helper for reference (shows the local coordinate axes)
+axis_helper = pj.AxesHelper(size=5)
+axis_helper.position = cubesat.position
+axis_helper.quaternion = cubesat.quaternion
+
+# Group the satellite components together.
+pivot = pj.Group()
+pivot.add(cubesat)
+if with_added_mass:
+    pivot.add(the_added_mass)
+pivot.add(axis_helper)
+
+# Create keyframe tracks from the simulation.
+# The position track uses the computed center-of-mass positions (scaled already).
+pivot_position_track = pj.VectorKeyframeTrack(name=".position", times=time.tolist(), values=positions.flatten().tolist())
+# The rotation track uses the quaternion trajectory.
+# pythreejs expects quaternions in [x, y, z, w] order, so we convert:
+def convert_quat(q):
+    # q is [w, x, y, z] so we convert to [x, y, z, w]
+    return np.hstack((q[1:], q[0]))
+rotations_py3 = np.array([convert_quat(qi) for qi in rotations])
+pivot_rotation_track = pj.QuaternionKeyframeTrack(name=".quaternion", times=time.tolist(), values=rotations_py3.flatten().tolist())
+
+pivot_clip = pj.AnimationClip(tracks=[pivot_position_track, pivot_rotation_track])
+pivot_mixer = pj.AnimationMixer(pivot)
+pivot_action = pj.AnimationAction(pivot_mixer, pivot_clip, pivot)
+pivot_action.play()  # start the animation
+
+scene.add(pivot)
+
+# Set up a second camera for viewing the scene
+view_width = 800
+view_height = 600
+camera_view = pj.PerspectiveCamera(position=[10, 6, 10], aspect=view_width / view_height)
+controls = pj.OrbitControls(controlling=camera_view)
+
+# Add lights
+ambient_light = pj.AmbientLight(color='#ffffff', intensity=1.0)
+key_light = pj.DirectionalLight(position=[0, 10, 0])
+scene.add(ambient_light)
+scene.add(key_light)
+
+# Create and display the renderer
+renderer = pj.Renderer(camera=camera_view, scene=scene, width=view_width, height=view_height)
+renderer.controls = [controls]
+display(renderer)
