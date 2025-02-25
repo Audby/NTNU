@@ -1,3 +1,6 @@
 [submodule "V2025/Sanntid/RustInAction/code"]
 	path = V2025/Sanntid/RustInAction/code
 	url = https://github.com/rust-in-action/code.git
+[submodule "V2025/Modsim/code-handouts"]
+	path = V2025/Modsim/code-handouts
+	url = https://github.com/TTK4130/code-handouts.git

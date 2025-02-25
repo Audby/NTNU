@@ -1,9 +1,9 @@
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 use std::{env, process, thread};
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::process::{Command, Stdio};
 
 // Configuration for heartbeat and timeout durations.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
@@ -16,10 +16,26 @@ const HEARTBEAT_ADDR: &str = "127.0.0.1:34254";
 fn spawn_backup() {
     let exe = env::current_exe().expect("Failed to get current executable");
     // Spawn a new instance with the "--backup" flag.
-    Command::new(exe)
-        .arg("--backup")
+    /* Linux version:
+        let childy = Command::new("xterm")
+            .arg("-e")          // Execute a command in the new terminal
+            .arg("Monospace")  // Use Monospace font or another standard font
+            .arg(format!("{} --backup", exe.display())) // Launch backup in new terminal
+            //.stdout(Stdio::inherit()) // Show stdout in the main process
+            //.stderr(Stdio::inherit()) // Show stderr in the main process
+            .spawn()
+            .expect("Failed to spawn backup process");
+
+        println!("child id {}", childy.id());
+     */
+
+    // Windows version:
+    let child = Command::new("cmd")
+        .args(&["/C", "start", exe.to_str().unwrap(), "--backup"])
         .spawn()
         .expect("Failed to spawn backup process");
+    
+    println!("child id {}", child.id());
 }
 
 fn main() {
@@ -33,6 +49,7 @@ fn main() {
     if !is_backup {
         // In the primary, we spawn the backup process immediately.
         spawn_backup();
+
     }
 
     if is_backup {
@@ -59,6 +76,7 @@ fn main() {
                     }
                     // Refresh our heartbeat timer.
                     last_heartbeat = Instant::now();
+                    println!("Recieved heartbeat, refreshing heartbeat timer")
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // Read timeout reached – do nothing and check below.
